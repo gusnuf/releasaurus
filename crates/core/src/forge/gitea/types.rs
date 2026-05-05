@@ -30,17 +30,8 @@ pub struct GiteaPullRequest {
     pub head: PullRequestBranch,
     pub merge_commit_sha: Option<String>,
     pub body: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GiteaIssuePr {
+    #[serde(default)]
     pub merged: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GiteaIssue {
-    pub number: u64,
-    pub pull_request: Option<GiteaIssuePr>,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,7 +130,7 @@ pub struct GiteaFileChange {
 
 #[derive(Debug, Serialize)]
 pub struct GiteaModifyFiles {
-    pub old_ref_name: String,
+    pub branch: String,
     pub new_branch: Option<String>,
     pub message: String,
     pub files: Vec<GiteaFileChange>,

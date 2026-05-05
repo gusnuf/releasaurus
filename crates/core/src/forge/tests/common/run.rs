@@ -5,7 +5,9 @@ use url::Url;
 use crate::{
     config::Config,
     forge::{
-        config::{LEGACY_PENDING_LABEL, PENDING_LABEL, RepoUrl, Scheme},
+        config::{
+            LEGACY_PENDING_LABEL, PENDING_LABEL, RepoUrl, Scheme, TAGGED_LABEL,
+        },
         manager::ForgeManager,
         request::{
             CreateCommitRequest, CreatePrRequest, CreateReleaseBranchRequest,
@@ -398,4 +400,175 @@ pub async fn run_forge_test(
     assert_eq!(config.packages[0].name, "test-package");
     assert_eq!(config.packages[0].workspace_root, "packages");
     assert_eq!(config.packages[0].path, "test-package");
+
+    ////////////////////////////////////////////////////////////////////////////
+    // finalize cycle 1: swap pending → tagged label
+    //
+    // mirrors the orchestrator's post-release finalize step
+    // (orchestrator.rs swaps PENDING_LABEL → TAGGED_LABEL after
+    // create_package_release succeeds). subsequent get_open /
+    // get_merged lookups must no longer surface this PR.
+    ////////////////////////////////////////////////////////////////////////////
+    log::info!("finalizing cycle 1: swapping pending → tagged label");
+    let replace_labels_req = PrLabelsRequest {
+        labels: vec![TAGGED_LABEL.into()],
+        pr_number: release_pr.number,
+    };
+    forge.replace_pr_labels(replace_labels_req).await.unwrap();
+    sleep(LONG_WAIT).await;
+
+    ////////////////////////////////////////////////////////////////////////////
+    // post-finalize: cycle 1's PR must no longer surface in either lookup
+    //
+    // direct regression for the forgejo /issues?labels= silent-drop
+    // bug: with the broken filter, the merged cycle-1 PR comes back
+    // here even though TAGGED_LABEL has replaced PENDING_LABEL.
+    ////////////////////////////////////////////////////////////////////////////
+    log::info!("verifying finalized cycle 1 PR is no longer surfaced");
+    let post_finalize_open = forge
+        .get_open_release_pr(GetPrRequest {
+            base_branch: default_branch.to_string(),
+            head_branch: release_branch.to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        post_finalize_open.is_none(),
+        "open release PR lookup must return None after PENDING_LABEL \
+         is cleared from the only matching PR"
+    );
+    let post_finalize_merged = forge
+        .get_merged_release_pr(GetPrRequest {
+            base_branch: default_branch.to_string(),
+            head_branch: release_branch.to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        post_finalize_merged.is_none(),
+        "merged release PR lookup must return None after PENDING_LABEL \
+         is cleared from the only matching PR"
+    );
+
+    ////////////////////////////////////////////////////////////////////////////
+    // cycle 2: open a second release PR on the same head branch
+    //
+    // reuses the existing release-branch (the orchestrator holds a
+    // single per-package release branch). a working labels filter
+    // must drop the cycle-1 PR by label state, since cycle-1 and
+    // cycle-2 share head.label.
+    ////////////////////////////////////////////////////////////////////////////
+    log::info!("creating cycle 2 release commit on existing release-branch");
+    let create_commit_req = CreateCommitRequest {
+        target_branch: release_branch.to_string(),
+        message: "chore(main): release v1.2.0".into(),
+        file_changes: vec![FileChange {
+            content: "# Changelog v1.2.0\n".into(),
+            path: "CHANGELOG.md".into(),
+            update_type: FileUpdateType::Prepend,
+        }],
+    };
+    let cycle2_release_commit = forge.create_commit(create_commit_req).await.unwrap();
+    assert!(!cycle2_release_commit.sha.is_empty());
+    sleep(SHORT_WAIT).await;
+
+    log::info!("creating cycle 2 release PR");
+    let create_pr_req = CreatePrRequest {
+        base_branch: default_branch.to_string(),
+        body: "Cycle 2 release PR".into(),
+        head_branch: release_branch.to_string(),
+        title: "Cycle 2 release PR".into(),
+    };
+    let release_pr_2 = forge.create_pr(create_pr_req).await.unwrap();
+    assert_ne!(release_pr_2.number, release_pr.number);
+    sleep(SHORT_WAIT).await;
+
+    log::info!("labeling cycle 2 PR with pending label");
+    let replace_labels_req = PrLabelsRequest {
+        labels: vec![PENDING_LABEL.into()],
+        pr_number: release_pr_2.number,
+    };
+    forge.replace_pr_labels(replace_labels_req).await.unwrap();
+    sleep(LONG_WAIT).await;
+
+    ////////////////////////////////////////////////////////////////////////////
+    // regression: get_open_release_pr must return ONLY cycle 2's PR.
+    //
+    // cycle 1's PR is closed (filtered by state=open) and now
+    // carries TAGGED_LABEL (filtered by labels=). leakage would
+    // surface as the wrong PR number or the multi-match error.
+    ////////////////////////////////////////////////////////////////////////////
+    log::info!("looking for cycle 2 open PR");
+    let get_pr_req = GetPrRequest {
+        base_branch: default_branch.to_string(),
+        head_branch: release_branch.to_string(),
+    };
+    let open_pr_2 = forge
+        .get_open_release_pr(get_pr_req)
+        .await
+        .unwrap()
+        .expect("cycle 2 open PR must be found");
+    assert_eq!(
+        open_pr_2.number, release_pr_2.number,
+        "open release PR lookup must return cycle 2's PR, not the \
+         finalized cycle 1 PR"
+    );
+
+    log::info!("merging cycle 2 release PR via helper");
+    helper.merge_pr(release_pr_2.number).await.unwrap();
+    sleep(LONG_WAIT).await;
+
+    ////////////////////////////////////////////////////////////////////////////
+    // regression: get_merged_release_pr must return ONLY cycle 2's PR.
+    //
+    // both cycle-1 and cycle-2 PRs are now closed and share
+    // head.label. on a forge whose labels= filter is silently
+    // dropped (forgejo /issues), both come back and the
+    // "Found more than one closed release PR" guard fires.
+    ////////////////////////////////////////////////////////////////////////////
+    log::info!("looking for cycle 2 merged PR");
+    let get_pr_req = GetPrRequest {
+        base_branch: default_branch.to_string(),
+        head_branch: release_branch.to_string(),
+    };
+    let merged_pr_2 = forge
+        .get_merged_release_pr(get_pr_req)
+        .await
+        .unwrap()
+        .expect("cycle 2 merged PR must be found");
+    assert_eq!(
+        merged_pr_2.number, release_pr_2.number,
+        "merged release PR lookup must return cycle 2's PR, not the \
+         finalized cycle 1 PR"
+    );
+    assert_ne!(merged_pr_2.sha, merged_pr.sha);
+
+    ////////////////////////////////////////////////////////////////////////////
+    // tag + release cycle 2; tag prefix lookup must return v1.2.0
+    ////////////////////////////////////////////////////////////////////////////
+    log::info!("tagging cycle 2 commit");
+    let semver_2 = "1.2.0";
+    let tag_2 = format!("v{}", semver_2);
+    forge.tag_commit(&tag_2, &merged_pr_2.sha).await.unwrap();
+    sleep(SHORT_WAIT).await;
+
+    log::info!("looking for latest tag by prefix after cycle 2");
+    let latest_tag = forge
+        .get_latest_tag_for_prefix("v", default_branch)
+        .await
+        .unwrap()
+        .expect("cycle 2 tag must be found");
+    assert_eq!(latest_tag.name, tag_2);
+    assert_eq!(latest_tag.semver, Version::parse(semver_2).unwrap());
+    assert_eq!(latest_tag.sha, merged_pr_2.sha);
+
+    log::info!("creating release for cycle 2 tag");
+    forge
+        .create_release(&latest_tag.name, &latest_tag.sha, "cycle 2 release notes")
+        .await
+        .unwrap();
+    sleep(SHORT_WAIT).await;
+
+    let release_2 = forge.get_release_by_tag(&latest_tag.name).await.unwrap();
+    assert_eq!(release_2.tag, latest_tag.name);
 }
