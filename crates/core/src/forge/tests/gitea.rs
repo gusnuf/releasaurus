@@ -33,4 +33,14 @@ async fn test_gitea_forge() {
     );
 
     run_forge_test(&manager, &helper).await;
+
+    // re-tagging same name at same sha must be a no-op
+    let existing = manager
+        .get_release_by_tag("v1.1.0")
+        .await
+        .expect("v1.1.0 must exist after run_forge_test");
+    manager
+        .tag_commit("v1.1.0", &existing.sha)
+        .await
+        .expect("re-tag at same sha must be idempotent");
 }

@@ -136,11 +136,36 @@ impl Gitea {
     }
 
     async fn get_all_labels(&self) -> Result<Vec<Label>> {
-        let labels_url = self.base_url.join("labels")?;
-        let request = self.client.get(labels_url).build()?;
-        let response = self.client.execute(request).await?;
-        let result = response.error_for_status()?;
-        let labels: Vec<Label> = result.json().await?;
+        // must paginate: callers rely on "all" being literal, otherwise
+        // a present label can look absent past page 1
+        let mut labels = vec![];
+        let mut has_more = true;
+        let mut page = 1;
+        let page_limit = DEFAULT_PAGE_SIZE.to_string();
+
+        while has_more {
+            let mut labels_url = self.base_url.join("labels")?;
+            labels_url
+                .query_pairs_mut()
+                .append_pair("limit", &page_limit)
+                .append_pair("page", &page.to_string());
+
+            let request = self.client.get(labels_url).build()?;
+            let response = self.client.execute(request).await?;
+            let headers = response.headers();
+
+            has_more = headers
+                .get("x-hasmore")
+                .map(|h| h.to_str().unwrap() == "true")
+                .unwrap_or(false);
+
+            let result = response.error_for_status()?;
+            let page_labels: Vec<Label> = result.json().await?;
+            labels.extend(page_labels);
+
+            page += 1;
+        }
+
         Ok(labels)
     }
 
@@ -565,6 +590,27 @@ impl Forge for Gitea {
         });
         let request = self.client.post(tag_url).json(&body).build()?;
         let response = self.client.execute(request).await?;
+
+        // idempotent on same-sha 409: tag already points where we want it
+        if response.status() == StatusCode::CONFLICT {
+            let existing_url =
+                self.base_url.join(&format!("tags/{tag_name}"))?;
+            let existing_req = self.client.get(existing_url).build()?;
+            let existing_resp = self.client.execute(existing_req).await?;
+            let existing: GiteaTag =
+                existing_resp.error_for_status()?.json().await?;
+            if existing.commit.sha == sha {
+                log::info!(
+                    "tag {tag_name} already exists at {sha}, treating as success"
+                );
+                return Ok(());
+            }
+            return Err(ReleasaurusError::forge(format!(
+                "tag {tag_name} already exists pointing at {} but expected {sha}",
+                existing.commit.sha
+            )));
+        }
+
         response.error_for_status()?;
         Ok(())
     }
@@ -573,12 +619,26 @@ impl Forge for Gitea {
         &self,
         req: GetPrRequest,
     ) -> Result<Option<PullRequest>> {
+        // forgejo/gitea `labels=` requires numeric ids — passing a name
+        // silently returns the unfiltered set
+        let all_labels = self.get_all_labels().await?;
+        let label_ids: Vec<u64> = [PENDING_LABEL, LEGACY_PENDING_LABEL]
+            .iter()
+            .filter_map(|name| {
+                all_labels.iter().find(|l| l.name == *name).map(|l| l.id)
+            })
+            .collect();
+
+        if label_ids.is_empty() {
+            return Ok(None);
+        }
+
         let mut found_prs = vec![];
 
         // Try the current label first, then fall back to the
         // legacy single-colon label for users upgrading from an
         // older version of releasaurus.
-        for pending_label in [PENDING_LABEL, LEGACY_PENDING_LABEL] {
+        for label_id in label_ids {
             if !found_prs.is_empty() {
                 break;
             }
@@ -586,16 +646,16 @@ impl Forge for Gitea {
             let mut has_more = true;
             let mut page = 1;
             let page_limit = DEFAULT_PAGE_SIZE.to_string();
+            let label_id_str = label_id.to_string();
 
             while has_more {
-                // Search for open issues with the pending label
-                let mut issues_url = self.base_url.join(&format!(
-                    "issues?state=open&type=pulls&labels={}",
-                    pending_label
-                ))?;
+                let mut issues_url = self.base_url.join("issues")?;
 
                 issues_url
                     .query_pairs_mut()
+                    .append_pair("state", "open")
+                    .append_pair("type", "pulls")
+                    .append_pair("labels", &label_id_str)
                     .append_pair("limit", &page_limit.to_string())
                     .append_pair("page", &page.to_string());
 
@@ -654,12 +714,26 @@ impl Forge for Gitea {
         &self,
         req: GetPrRequest,
     ) -> Result<Option<PullRequest>> {
+        // forgejo/gitea `labels=` requires numeric ids — passing a name
+        // silently returns the unfiltered set
+        let all_labels = self.get_all_labels().await?;
+        let label_ids: Vec<u64> = [PENDING_LABEL, LEGACY_PENDING_LABEL]
+            .iter()
+            .filter_map(|name| {
+                all_labels.iter().find(|l| l.name == *name).map(|l| l.id)
+            })
+            .collect();
+
+        if label_ids.is_empty() {
+            return Ok(None);
+        }
+
         let mut found_prs = vec![];
 
         // Try the current label first, then fall back to the
         // legacy single-colon label for users upgrading from an
         // older version of releasaurus.
-        for pending_label in [PENDING_LABEL, LEGACY_PENDING_LABEL] {
+        for label_id in label_ids {
             if !found_prs.is_empty() {
                 break;
             }
@@ -667,16 +741,16 @@ impl Forge for Gitea {
             let mut has_more = true;
             let mut page = 1;
             let page_limit = DEFAULT_PAGE_SIZE.to_string();
+            let label_id_str = label_id.to_string();
 
             while has_more {
-                // Search for closed issues with the pending label
-                let mut issues_url = self.base_url.join(&format!(
-                    "issues?state=closed&labels={}",
-                    pending_label
-                ))?;
+                let mut issues_url = self.base_url.join("issues")?;
 
                 issues_url
                     .query_pairs_mut()
+                    .append_pair("state", "closed")
+                    .append_pair("type", "pulls")
+                    .append_pair("labels", &label_id_str)
                     .append_pair("limit", &page_limit.to_string())
                     .append_pair("page", &page.to_string());
 
