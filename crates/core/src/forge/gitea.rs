@@ -26,7 +26,7 @@ use crate::{
             CreateLabel, CreatePull, CreateRelease, GiteaCommitQueryObject,
             GiteaCreatedCommit, GiteaFileChange, GiteaFileChangeOperation,
             GiteaModifyFiles, GiteaPullRequest, GiteaRelease, GiteaTag, Label,
-            UpdatePullBody, UpdatePullLabels,
+            UpdatePullBody, UpdatePullLabels, UpdatePullState,
         },
         request::{
             Commit, CreateCommitRequest, CreatePrRequest,
@@ -133,6 +133,36 @@ impl Gitea {
         let file: serde_json::Value = result.json().await?;
         let sha = file["sha"].as_str().wrap_err("failed to get file sha")?;
         Ok(sha.into())
+    }
+
+    async fn branch_exists(&self, name: &str) -> Result<bool> {
+        let url = self.base_url.join(&format!("branches/{name}"))?;
+        let response = self.client.get(url).send().await?;
+        match response.status() {
+            StatusCode::OK => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            _ => {
+                response.error_for_status()?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn delete_branch(&self, name: &str) -> Result<()> {
+        let url = self.base_url.join(&format!("branches/{name}"))?;
+        let response = self.client.delete(url).send().await?;
+        response.error_for_status()?;
+        Ok(())
+    }
+
+    async fn set_pr_state(&self, pr_number: u64, state: &str) -> Result<()> {
+        let url = self.base_url.join(&format!("pulls/{pr_number}"))?;
+        let body = UpdatePullState {
+            state: state.into(),
+        };
+        let response = self.client.patch(url).json(&body).send().await?;
+        response.error_for_status()?;
+        Ok(())
     }
 
     async fn get_all_labels(&self) -> Result<Vec<Label>> {
@@ -473,6 +503,27 @@ impl Forge for Gitea {
         &self,
         req: CreateReleaseBranchRequest,
     ) -> Result<Commit> {
+        // forgejo's POST /contents with new_branch set 422s with
+        // "branch already exists" when the target branch already exists,
+        // even with force_push=true — there's no API to force-update an
+        // existing branch's HEAD. for cycles after the first we delete
+        // the existing release branch so the new commit lands fresh on
+        // top of base_branch. delete_branch auto-closes any open PR
+        // pointing at the deleted head; capture it first and reopen
+        // afterwards so reviews, labels, and PR number survive.
+        let pr_to_reopen = if self.branch_exists(&req.release_branch).await? {
+            let existing_pr = self
+                .get_open_release_pr(GetPrRequest {
+                    base_branch: req.base_branch.clone(),
+                    head_branch: req.release_branch.clone(),
+                })
+                .await?;
+            self.delete_branch(&req.release_branch).await?;
+            existing_pr.map(|pr| pr.number)
+        } else {
+            None
+        };
+
         let mut file_changes: Vec<GiteaFileChange> = vec![];
 
         for change in req.file_changes.iter() {
@@ -514,6 +565,10 @@ impl Forge for Gitea {
         let response = self.client.execute(request).await?;
         let result = response.error_for_status()?;
         let created: GiteaCreatedCommit = result.json().await?;
+
+        if let Some(pr_number) = pr_to_reopen {
+            self.set_pr_state(pr_number, "open").await?;
+        }
 
         Ok(created.commit)
     }

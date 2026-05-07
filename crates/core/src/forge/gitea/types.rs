@@ -49,6 +49,11 @@ pub struct UpdatePullBody {
 }
 
 #[derive(Debug, Serialize)]
+pub struct UpdatePullState {
+    pub state: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct UpdatePullLabels {
     pub labels: Vec<u64>,
 }

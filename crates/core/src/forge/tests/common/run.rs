@@ -457,18 +457,27 @@ pub async fn run_forge_test(
     // single per-package release branch). a working labels filter
     // must drop the cycle-1 PR by label state, since cycle-1 and
     // cycle-2 share head.label.
+    //
+    // direct regression for the forgejo POST /contents 422 ("branch
+    // already exists") on new_branch=<existing>: the orchestrator
+    // calls create_release_branch every cycle, so the gitea driver
+    // must succeed on the second call too.
     ////////////////////////////////////////////////////////////////////////////
     log::info!("creating cycle 2 release commit on existing release-branch");
-    let create_commit_req = CreateCommitRequest {
-        target_branch: release_branch.to_string(),
+    let create_branch_req = CreateReleaseBranchRequest {
+        base_branch: default_branch.to_string(),
         message: "chore(main): release v1.2.0".into(),
+        release_branch: release_branch.to_string(),
         file_changes: vec![FileChange {
             content: "# Changelog v1.2.0\n".into(),
             path: "CHANGELOG.md".into(),
             update_type: FileUpdateType::Prepend,
         }],
     };
-    let cycle2_release_commit = forge.create_commit(create_commit_req).await.unwrap();
+    let cycle2_release_commit = forge
+        .create_release_branch(create_branch_req)
+        .await
+        .unwrap();
     assert!(!cycle2_release_commit.sha.is_empty());
     sleep(SHORT_WAIT).await;
 
@@ -490,6 +499,54 @@ pub async fn run_forge_test(
     };
     forge.replace_pr_labels(replace_labels_req).await.unwrap();
     sleep(LONG_WAIT).await;
+
+    ////////////////////////////////////////////////////////////////////////////
+    // regression: re-running create_release_branch while cycle 2's PR is
+    // still open simulates "main got a new commit while a release PR is
+    // pending". on forgejo, deleting the head branch auto-closes the
+    // PR; the gitea driver must reopen it so the same PR number,
+    // labels, and review thread survive the rebase.
+    ////////////////////////////////////////////////////////////////////////////
+    log::info!("re-running create_release_branch with cycle 2's PR open");
+    let rebased_branch_req = CreateReleaseBranchRequest {
+        base_branch: default_branch.to_string(),
+        message: "chore(main): release v1.2.0 (rebased)".into(),
+        release_branch: release_branch.to_string(),
+        file_changes: vec![FileChange {
+            content: "# Changelog v1.2.0 (rebased)\n".into(),
+            path: "CHANGELOG.md".into(),
+            update_type: FileUpdateType::Prepend,
+        }],
+    };
+    let rebased_release_commit = forge
+        .create_release_branch(rebased_branch_req)
+        .await
+        .unwrap();
+    assert!(!rebased_release_commit.sha.is_empty());
+    assert_ne!(rebased_release_commit.sha, cycle2_release_commit.sha);
+    sleep(LONG_WAIT).await;
+
+    let surviving_pr = forge
+        .get_open_release_pr(GetPrRequest {
+            base_branch: default_branch.to_string(),
+            head_branch: release_branch.to_string(),
+        })
+        .await
+        .unwrap()
+        .expect(
+            "cycle 2 PR must survive create_release_branch on existing \
+             branch — driver must reopen after delete + recreate",
+        );
+    assert_eq!(
+        surviving_pr.number, release_pr_2.number,
+        "create_release_branch must preserve the same PR number; a \
+         brand-new PR means reviews and the original PENDING label \
+         were lost"
+    );
+    assert_eq!(
+        surviving_pr.sha, rebased_release_commit.sha,
+        "open PR's head sha must follow the rebased commit"
+    );
 
     ////////////////////////////////////////////////////////////////////////////
     // regression: get_open_release_pr must return ONLY cycle 2's PR.
@@ -564,7 +621,11 @@ pub async fn run_forge_test(
 
     log::info!("creating release for cycle 2 tag");
     forge
-        .create_release(&latest_tag.name, &latest_tag.sha, "cycle 2 release notes")
+        .create_release(
+            &latest_tag.name,
+            &latest_tag.sha,
+            "cycle 2 release notes",
+        )
         .await
         .unwrap();
     sleep(SHORT_WAIT).await;
