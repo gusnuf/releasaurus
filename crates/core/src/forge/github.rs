@@ -425,6 +425,22 @@ impl Forge for Github {
                                 .map(|t| t.timestamp())
                                 .ok(),
                             });
+                        } else {
+                            log::warn!(
+                                "tag {} ({}) matches prefix but its commit \
+                                 is not an ancestor of branch {}; ignoring \
+                                 — next-version computation will fall back \
+                                 to an older tag, which can cause duplicate \
+                                 releases. likely cause: a force-push or \
+                                 branch reset rewrote {} after the tag was \
+                                 created. retag at the current release \
+                                 commit on {} to fix.",
+                                tag.name,
+                                sha,
+                                branch,
+                                branch,
+                                branch,
+                            );
                         }
                     }
                 }

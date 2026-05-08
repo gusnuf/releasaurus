@@ -353,21 +353,37 @@ impl Forge for Gitlab {
         for tag in gitlab_tags.into_iter() {
             if re.is_match(&tag.name) {
                 let stripped = re.replace_all(&tag.name, "").to_string();
-                if let Ok(sver) = semver::Version::parse(&stripped)
-                    && self
+                if let Ok(sver) = semver::Version::parse(&stripped) {
+                    if self
                         .is_tag_ancestor_of_branch(&tag.commit.id, branch)
                         .await?
-                {
-                    tags.push(Tag {
-                        name: tag.name,
-                        semver: sver,
-                        sha: tag.commit.id,
-                        timestamp: DateTime::parse_from_rfc3339(
-                            &tag.commit.created_at,
-                        )
-                        .map(|t| t.timestamp())
-                        .ok(),
-                    });
+                    {
+                        tags.push(Tag {
+                            name: tag.name,
+                            semver: sver,
+                            sha: tag.commit.id,
+                            timestamp: DateTime::parse_from_rfc3339(
+                                &tag.commit.created_at,
+                            )
+                            .map(|t| t.timestamp())
+                            .ok(),
+                        });
+                    } else {
+                        log::warn!(
+                            "tag {} ({}) matches prefix but its commit is \
+                             not an ancestor of branch {}; ignoring — \
+                             next-version computation will fall back to an \
+                             older tag, which can cause duplicate releases. \
+                             likely cause: a force-push or branch reset \
+                             rewrote {} after the tag was created. retag \
+                             at the current release commit on {} to fix.",
+                            tag.name,
+                            tag.commit.id,
+                            branch,
+                            branch,
+                            branch,
+                        );
+                    }
                 }
             }
         }

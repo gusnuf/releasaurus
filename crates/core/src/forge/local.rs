@@ -487,11 +487,27 @@ impl Forge for LocalRepo {
         // so graph_descendant_of(branch_head, tag) means tag is an ancestor
         // of branch_head. We also include the case where the tag IS the
         // branch head (e.g., immediately after a release is tagged).
-        commits.retain(|(commit, _)| {
-            commit.id() == branch_head_oid
+        commits.retain(|(commit, tag)| {
+            let is_ancestor = commit.id() == branch_head_oid
                 || repo
                     .graph_descendant_of(branch_head_oid, commit.id())
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+            if !is_ancestor {
+                log::warn!(
+                    "tag {} ({}) matches prefix but its commit is not an \
+                     ancestor of branch {}; ignoring — next-version \
+                     computation will fall back to an older tag, which can \
+                     cause duplicate releases. likely cause: a force-push \
+                     or branch reset rewrote {} after the tag was created. \
+                     retag at the current release commit on {} to fix.",
+                    tag.name,
+                    tag.sha,
+                    branch,
+                    branch,
+                    branch,
+                );
+            }
+            is_ancestor
         });
 
         Ok(commits.into_iter().map(|(_, tag)| tag).collect())
